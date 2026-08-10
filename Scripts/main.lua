@@ -4,6 +4,8 @@ local HOVER_FN = "/Game/Pal/Blueprint/UI/PalStorage/WBP_PalStorageMenu.WBP_PalSt
 local SETUP_FN = "/Game/Pal/Blueprint/UI/PalStatus/WBP_PalStatus.WBP_PalStatus_C:Setup One Pal"
 local NAME_EDIT_OPEN_FN = "/Game/Pal/Blueprint/UI/UserInterface/MainMenu/Pal/WBP_MainMenu_Pal_00.WBP_MainMenu_Pal_00_C:OpenNameEditWindow"
 local NAME_EDIT_CLOSE_FN = "/Game/Pal/Blueprint/UI/UserInterface/MainMenu/Pal/WBP_MainMenu_Pal_00.WBP_MainMenu_Pal_00_C:OnCloseNameEditWindow"
+local TO_SKILL_DETAIL_FN = "/Game/Pal/Blueprint/UI/PalStatus/WBP_PalStatus.WBP_PalStatus_C:ToSkillDetail"
+local TO_PARAMETER_DETAIL_FN = "/Game/Pal/Blueprint/UI/PalStatus/WBP_PalStatus.WBP_PalStatus_C:ToParameterDetail"
 local CANCEL_FN = "/Game/Pal/Blueprint/UI/PalStatus/StatusPopup/WBP_PalStatusPopup.WBP_PalStatusPopup_C:OnCancelAction"
 
 local VIS_VISIBLE = 0
@@ -11,7 +13,7 @@ local VIS_COLLAPSED = 1
 local VIS_HIT_TEST_INVISIBLE = 3
 local VIS_SELF_HIT_TEST_INVISIBLE = 4
 
-local hooks_ready = { hover = false, setup = false, cancel = false, name_open = false, name_close = false }
+local hooks_ready = { hover = false, setup = false, cancel = false, name_open = false, name_close = false, controller_prev = false, controller_next = false }
 local retry_pending = false
 
 local palbox_container = nil
@@ -22,6 +24,7 @@ local details_open = false
 local details_popup = nil
 local popup_seen_open = false
 local nickname_editing = false
+local input_display_mode = "keyboard"
 
 local overlay = nil
 local overlay_root = nil
@@ -340,6 +343,21 @@ local function set_text(widget, value)
     end
 end
 
+local function update_input_labels(mode)
+    input_display_mode = mode
+    if valid(left_widgets[2]) then set_text(left_widgets[2], mode == "controller" and "LT" or "A") end
+    if valid(right_widgets[2]) then set_text(right_widgets[2], mode == "controller" and "RT" or "D") end
+end
+
+local function detect_input_mode()
+    local ok, input = pcall(function() return FindFirstOf("CommonInputSubsystem") end)
+    if not ok or not valid(input) then return input_display_mode end
+
+    ok, input = pcall(function() return unwrap(input:GetCurrentInputType()) end)
+    if not ok then return input_display_mode end
+    return tonumber(input) == 0 and "keyboard" or "controller"
+end
+
 local function set_overlay_visible(visible)
     local visibility = visible and VIS_SELF_HIT_TEST_INVISIBLE or VIS_COLLAPSED
     if valid(overlay) then pcall(function() overlay:SetVisibility(visibility) end) end
@@ -514,8 +532,8 @@ local function build_overlay()
     pcall(function() root:SetVisibility(VIS_SELF_HIT_TEST_INVISIBLE) end)
 
     update_rects(pc)
-    left_widgets = add_control(tree, root, left_rect, "A", "←") or {}
-    right_widgets = add_control(tree, root, right_rect, "D", "→") or {}
+    left_widgets = add_control(tree, root, left_rect, input_display_mode == "controller" and "LT" or "A", "←") or {}
+    right_widgets = add_control(tree, root, right_rect, input_display_mode == "controller" and "RT" or "D", "→") or {}
 
     if not pcall(function() widget:AddToViewport(80) end) then
         overlay, overlay_root = nil, nil
@@ -603,6 +621,7 @@ install_hooks = function()
                 details_popup = find_popup_ancestor(context)
                 popup_seen_open = false
                 details_open = true
+                update_input_labels(detect_input_mode())
                 set_overlay_visible(true)
                 update_control_visibility()
             end, function() end)
@@ -637,15 +656,37 @@ install_hooks = function()
         hooks_ready.name_close = ok
     end
 
-    if not (hooks_ready.hover and hooks_ready.setup and hooks_ready.cancel and hooks_ready.name_open and hooks_ready.name_close) then
+    if not hooks_ready.controller_prev then
+        hooks_ready.controller_prev = pcall(function()
+            RegisterHook(TO_SKILL_DETAIL_FN, function()
+                if details_open and not nickname_editing then
+                    update_input_labels("controller")
+                    navigate(-1)
+                end
+            end, function() end)
+        end)
+    end
+
+    if not hooks_ready.controller_next then
+        hooks_ready.controller_next = pcall(function()
+            RegisterHook(TO_PARAMETER_DETAIL_FN, function()
+                if details_open and not nickname_editing then
+                    update_input_labels("controller")
+                    navigate(1)
+                end
+            end, function() end)
+        end)
+    end
+
+    if not (hooks_ready.hover and hooks_ready.setup and hooks_ready.cancel and hooks_ready.name_open and hooks_ready.name_close and hooks_ready.controller_prev and hooks_ready.controller_next) then
         schedule_retry()
     end
 end
 
-RegisterKeyBind(Key.A, function() navigate(-1) end)
-RegisterKeyBind(Key.LEFT_ARROW, function() navigate(-1) end)
-RegisterKeyBind(Key.D, function() navigate(1) end)
-RegisterKeyBind(Key.RIGHT_ARROW, function() navigate(1) end)
+RegisterKeyBind(Key.A, function() update_input_labels("keyboard"); navigate(-1) end)
+RegisterKeyBind(Key.LEFT_ARROW, function() update_input_labels("keyboard"); navigate(-1) end)
+RegisterKeyBind(Key.D, function() update_input_labels("keyboard"); navigate(1) end)
+RegisterKeyBind(Key.RIGHT_ARROW, function() update_input_labels("keyboard"); navigate(1) end)
 
 local mouse_ok, mouse_err = pcall(function()
     RegisterKeyBind(Key.LEFT_MOUSE_BUTTON, handle_click)
