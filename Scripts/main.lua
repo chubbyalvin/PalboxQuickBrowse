@@ -2,6 +2,8 @@ local TAG = "[PalboxQuickBrowse]"
 
 local HOVER_FN = "/Game/Pal/Blueprint/UI/PalStorage/WBP_PalStorageMenu.WBP_PalStorageMenu_C:BndEvt__WBP_PalStorageMenu_WBP_IngameMenu_PalBox_K2Node_ComponentBoundEvent_1_OnHoveredBoxSlot__DelegateSignature"
 local SETUP_FN = "/Game/Pal/Blueprint/UI/PalStatus/WBP_PalStatus.WBP_PalStatus_C:Setup One Pal"
+local NAME_EDIT_OPEN_FN = "/Game/Pal/Blueprint/UI/UserInterface/MainMenu/Pal/WBP_MainMenu_Pal_00.WBP_MainMenu_Pal_00_C:OpenNameEditWindow"
+local NAME_EDIT_CLOSE_FN = "/Game/Pal/Blueprint/UI/UserInterface/MainMenu/Pal/WBP_MainMenu_Pal_00.WBP_MainMenu_Pal_00_C:OnCloseNameEditWindow"
 local CANCEL_FN = "/Game/Pal/Blueprint/UI/PalStatus/StatusPopup/WBP_PalStatusPopup.WBP_PalStatusPopup_C:OnCancelAction"
 
 local VIS_VISIBLE = 0
@@ -9,7 +11,7 @@ local VIS_COLLAPSED = 1
 local VIS_HIT_TEST_INVISIBLE = 3
 local VIS_SELF_HIT_TEST_INVISIBLE = 4
 
-local hooks_ready = { hover = false, setup = false, cancel = false }
+local hooks_ready = { hover = false, setup = false, cancel = false, name_open = false, name_close = false }
 local retry_pending = false
 
 local palbox_container = nil
@@ -19,6 +21,7 @@ local suppress_setup = false
 local details_open = false
 local details_popup = nil
 local popup_seen_open = false
+local nickname_editing = false
 
 local overlay = nil
 local overlay_root = nil
@@ -273,7 +276,7 @@ end
 local update_control_visibility
 
 local function navigate(direction)
-    if not details_open or not valid(current_handle) then return false end
+    if not details_open or not valid(current_handle) or nickname_editing then return false end
 
     local current_slot = resolve_current_slot()
     if not valid(current_slot) then
@@ -357,6 +360,7 @@ local function close_details()
     details_open = false
     details_popup = nil
     popup_seen_open = false
+    nickname_editing = false
     active_container = nil
     current_handle = nil
     suppress_setup = false
@@ -615,7 +619,25 @@ install_hooks = function()
         hooks_ready.cancel = ok
     end
 
-    if not (hooks_ready.hover and hooks_ready.setup and hooks_ready.cancel) then
+    if not hooks_ready.name_open then
+        local ok = pcall(function()
+            RegisterHook(NAME_EDIT_OPEN_FN, function()
+                nickname_editing = true
+            end, function() end)
+        end)
+        hooks_ready.name_open = ok
+    end
+
+    if not hooks_ready.name_close then
+        local ok = pcall(function()
+            RegisterHook(NAME_EDIT_CLOSE_FN, function()
+                nickname_editing = false
+            end, function() end)
+        end)
+        hooks_ready.name_close = ok
+    end
+
+    if not (hooks_ready.hover and hooks_ready.setup and hooks_ready.cancel and hooks_ready.name_open and hooks_ready.name_close) then
         schedule_retry()
     end
 end
