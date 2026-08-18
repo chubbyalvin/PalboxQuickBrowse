@@ -9,7 +9,8 @@ When checking several Pals, you normally have to open a Pal's details, go back t
 ## Features
 
 - Browse the previous or next Pal without leaving the Details page
-- Use **A / D** or the **Left / Right Arrow Keys**
+- Use **A / D** or the **Left / Right Arrow Keys** with keyboard
+- Use **LT / L2** or **RT / R2** with controller
 - On-screen navigation controls for mouse users
 - Automatically skips empty Palbox slots
 - Navigation buttons automatically disappear when you reach the first or last available Pal
@@ -17,15 +18,17 @@ When checking several Pals, you normally have to open a Pal's details, go back t
   - Palbox Pals
   - Base Pals
   - Party Pals from within the Palbox
+  - Party Pals from the separate Party menu
+- Supports expanded Party sizes dynamically
 - Lightweight UE4SS mod
 - No configuration required
 
 ## Controls
 
-| Action | Keyboard |
-| --- | --- |
-| Previous Pal | **A** or **←** |
-| Next Pal | **D** or **→** |
+| Action | Keyboard | Controller |
+| --- | --- | --- |
+| Previous Pal | **A** or **←** | **LT / L2** |
+| Next Pal | **D** or **→** | **RT / R2** |
 
 You can also click the navigation controls displayed on the left and right sides of the Pal Details screen.
 
@@ -71,7 +74,7 @@ Your Steam library drive or folder may differ.
 1. Start Palworld.
 2. Open your Palbox.
 3. Open a Pal's Details page.
-4. Use **A / D**, **← / →**, or the on-screen controls to browse directly between Pals.
+4. Use **A / D**, **← / →**, **LT / L2**, **RT / R2**, or the on-screen controls to browse directly between Pals.
 
 The mod automatically skips empty slots.
 
@@ -84,8 +87,8 @@ Palbox Quick Browse currently supports browsing:
 - Palbox Pals
 - Base Pals
 - Party Pals accessed from within the Palbox
-
-Browsing directly from Palworld's separate **Party menu** is not currently supported.
+- Party Pals from Palworld's separate **Party menu**
+- Expanded Party layouts
 
 ## Troubleshooting
 
