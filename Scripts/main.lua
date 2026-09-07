@@ -1,5 +1,5 @@
 local TAG = "[PalboxQuickBrowse]"
-local VERSION = "2.0"
+local VERSION = "2.1"
 
 
 local PB_HOVER_FN = "/Game/Pal/Blueprint/UI/PalStorage/WBP_PalStorageMenu.WBP_PalStorageMenu_C:BndEvt__WBP_PalStorageMenu_WBP_IngameMenu_PalBox_K2Node_ComponentBoundEvent_1_OnHoveredBoxSlot__DelegateSignature"
@@ -52,6 +52,8 @@ local hooks_ready = {
     model_get_camera = false,
 }
 local retry_pending = false
+local hook_install_attempts = 0
+local HOOK_INSTALL_MAX_ATTEMPTS = 30
 
 local function new_ui_state()
     return {
@@ -861,9 +863,105 @@ local function pb_find_neighbor(index, direction)
     return nil
 end
 
+-- Generic Pal-search API. Providers publish only the current filtered Pal
+-- and its two native-storage neighbors. Shared values are primitives, never UObjects.
+local API_PREFIX = "PalboxQuickBrowse.API."
+local function api_read(key)
+    local ok, value = pcall(function() return ModRef:GetSharedVariable(API_PREFIX .. key) end)
+    return ok and value or nil
+end
+local function api_write(key, value)
+    return pcall(function() ModRef:SetSharedVariable(API_PREFIX .. key, value) end)
+end
+api_write("Version", 1)
+
+local function api_integer(value)
+    return type(value) == "number" and value >= 0 and value < 2147483647
+        and value == math.floor(value)
+end
+
+local function api_storage()
+    local utility = get_class("/Script/Pal.Default__PalUtility")
+    local pc = get_player_controller()
+    if not valid(utility) or not valid(pc) then return nil end
+    local ok, storage = pcall(function()
+        local data = unwrap(utility:GetPlayerDataStorage(pc))
+        return unwrap(data:GetPalStorage())
+    end)
+    return ok and valid(storage) and storage or nil
+end
+
+local function api_resolve(storage, page, index, identity)
+    if not api_integer(page) or not api_integer(index)
+        or type(identity) ~= "string" or identity == "" then return nil end
+    local ok, first, second = pcall(function() return storage:GetSlotsInPage(page) end)
+    local slots = ok and unwrap(first or second) or nil
+    if slots == nil then
+        local out = {}
+        ok = pcall(function() storage:GetSlotsInPage(page, out) end)
+        if ok then slots = out end
+    end
+    if slots == nil then return nil end
+    for _, candidate in ipairs({ index, index - 1 }) do
+        local read_ok, slot = pcall(function() return unwrap(slots[candidate]) end)
+        local handle = read_ok and slot_handle(slot) or nil
+        if valid(handle) and full_name(handle) == identity then return handle end
+    end
+    return nil
+end
+
+local function api_context()
+    local provider = api_read("ActiveProvider")
+    if type(provider) ~= "string" or not provider:match("^[%w_-]+$") then return nil end
+    local prefix = provider .. "."
+    local current = api_read(prefix .. "Current")
+    if type(current) ~= "string" or current == ""
+        or current ~= full_name(PB.current_handle) then return nil end
+
+    local values = {}
+    for _, side in ipairs({ "Previous", "Next" }) do
+        values[side .. "Page"] = api_read(prefix .. side .. "Page")
+        values[side .. "Slot"] = api_read(prefix .. side .. "Slot")
+        values[side .. "Handle"] = api_read(prefix .. side .. "Handle")
+    end
+    -- ActiveProvider is written last by the provider; Current identifies this snapshot.
+    if current ~= api_read(prefix .. "Current")
+        or provider ~= api_read("ActiveProvider") then return nil end
+
+    local storage = api_storage()
+    if not valid(storage) then return nil end
+    local context = { provider = provider }
+    for _, side in ipairs({ "Previous", "Next" }) do
+        local page = values[side .. "Page"]
+        local index = values[side .. "Slot"]
+        local identity = values[side .. "Handle"]
+        if page == -1 and index == -1 and identity == "" then
+            context[side] = false -- Valid filtered-list boundary.
+        else
+            local handle = api_resolve(storage, page, index, identity)
+            if not valid(handle) or same_object(handle, PB.current_handle) then return nil end
+            context[side] = handle
+        end
+    end
+    return context
+end
+
+local function api_clear_active()
+    if type(api_read("ActiveProvider")) == "string" then
+        api_write("ActiveProvider", "")
+    end
+end
+
+local function pb_target_handle(index, direction)
+    local context = api_context()
+    if context ~= nil then return context[direction < 0 and "Previous" or "Next"] end
+    return slot_handle(pb_find_neighbor(index, direction))
+end
+
 local pb_update_control_visibility
 
 local function pb_close_details()
+    api_clear_active()
     PB.details_open = false
     PB.details_popup = nil
     PB.popup_seen_open = false
@@ -899,8 +997,8 @@ pb_update_control_visibility = function()
         return
     end
 
-    ui_set_control_visible(PB.ui.left_widgets, valid(pb_find_neighbor(index, -1)))
-    ui_set_control_visible(PB.ui.right_widgets, valid(pb_find_neighbor(index, 1)))
+    ui_set_control_visible(PB.ui.left_widgets, valid(pb_target_handle(index, -1)))
+    ui_set_control_visible(PB.ui.right_widgets, valid(pb_target_handle(index, 1)))
 end
 
 local function pb_navigate(direction)
@@ -919,10 +1017,7 @@ local function pb_navigate(direction)
     local index = slot_index(current_slot)
     if index == nil then return false end
 
-    local target_slot = pb_find_neighbor(index, direction)
-    if not valid(target_slot) then return false end
-
-    local target_handle = slot_handle(target_slot)
+    local target_handle = pb_target_handle(index, direction)
     if not valid(target_handle) then return false end
 
 
@@ -1267,7 +1362,7 @@ end
 local install_hooks
 
 local function schedule_retry()
-    if retry_pending then return end
+    if retry_pending or hook_install_attempts >= HOOK_INSTALL_MAX_ATTEMPTS then return end
     retry_pending = true
 
     ExecuteWithDelay(1000, function()
@@ -1277,6 +1372,8 @@ local function schedule_retry()
 end
 
 install_hooks = function()
+    if hook_install_attempts >= HOOK_INSTALL_MAX_ATTEMPTS then return end
+    hook_install_attempts = hook_install_attempts + 1
     if not hooks_ready.pb_setup_party then
         hooks_ready.pb_setup_party = pcall(function()
             RegisterHook(PB_SETUP_PARTY_FN, function(context)
@@ -1479,32 +1576,91 @@ install_hooks = function()
         and hooks_ready.model_get_camera
 
     if not all_ready then
-        log("Hooks not all ready yet; retrying in 1s")
-        schedule_retry()
+        if hook_install_attempts < HOOK_INSTALL_MAX_ATTEMPTS then
+            schedule_retry()
+        else
+            log("UI hooks still incomplete after " .. tostring(HOOK_INSTALL_MAX_ATTEMPTS) .. " attempts; stopping hook retries")
+        end
     end
 end
 
+local function client_viewport_ready()
+    local pc = get_player_controller()
+    if not valid(pc) then return false end
 
-RegisterKeyBind(Key.A, function() request_navigate(-1, "keyboard") end)
-RegisterKeyBind(Key.D, function() request_navigate(1, "keyboard") end)
+    local library = get_class("/Script/UMG.Default__WidgetLayoutLibrary")
+    if not valid(library) then return false end
 
-local left_arrow_ok, left_arrow_err = pcall(function()
-    RegisterKeyBind(Key.LEFT_ARROW, function() request_navigate(-1, "keyboard") end)
-end)
+    local ok, size = pcall(function() return library:GetViewportSize(pc) end)
+    if not ok or size == nil then return false end
 
-local right_arrow_ok, right_arrow_err = pcall(function()
-    RegisterKeyBind(Key.RIGHT_ARROW, function() request_navigate(1, "keyboard") end)
-end)
+    local x, y
+    ok, x, y = pcall(function() return tonumber(size.X), tonumber(size.Y) end)
+    return ok and x ~= nil and y ~= nil and x > 0 and y > 0
+end
 
-local mouse_ok, mouse_err = pcall(function()
-    RegisterKeyBind(Key.LEFT_MOUSE_BUTTON, function()
-        dispatch_game_thread(handle_click)
+local client_started = false
+local client_viewport_waits = 0
+local CLIENT_VIEWPORT_MAX_WAITS = 10
+
+local function start_client()
+    if client_started then return end
+    client_started = true
+
+    RegisterKeyBind(Key.A, function() request_navigate(-1, "keyboard") end)
+    RegisterKeyBind(Key.D, function() request_navigate(1, "keyboard") end)
+
+    local left_arrow_ok, left_arrow_err = pcall(function()
+        RegisterKeyBind(Key.LEFT_ARROW, function() request_navigate(-1, "keyboard") end)
     end)
-end)
 
-install_hooks()
+    local right_arrow_ok, right_arrow_err = pcall(function()
+        RegisterKeyBind(Key.RIGHT_ARROW, function() request_navigate(1, "keyboard") end)
+    end)
 
-log("Palbox Quick Browse v" .. VERSION .. " loaded")
-if not left_arrow_ok then log("Left Arrow binding unavailable: " .. tostring(left_arrow_err)) end
-if not right_arrow_ok then log("Right Arrow binding unavailable: " .. tostring(right_arrow_err)) end
-if not mouse_ok then log("Mouse binding unavailable: " .. tostring(mouse_err)) end
+    local mouse_ok, mouse_err = pcall(function()
+        RegisterKeyBind(Key.LEFT_MOUSE_BUTTON, function()
+            dispatch_game_thread(handle_click)
+        end)
+    end)
+
+    install_hooks()
+
+    local api_had_provider = false
+    if type(LoopInGameThreadWithDelay) == "function" then
+        LoopInGameThreadWithDelay(250, function()
+            local provider = api_read("ActiveProvider")
+            local has_provider = type(provider) == "string" and provider ~= ""
+            if PB.details_open and (has_provider or api_had_provider) then
+                pb_update_control_visibility()
+            end
+            api_had_provider = has_provider
+        end)
+    end
+
+    log("Palbox Quick Browse v" .. VERSION .. " loaded")
+    if not left_arrow_ok then log("Left Arrow binding unavailable: " .. tostring(left_arrow_err)) end
+    if not right_arrow_ok then log("Right Arrow binding unavailable: " .. tostring(right_arrow_err)) end
+    if not mouse_ok then log("Mouse binding unavailable: " .. tostring(mouse_err)) end
+end
+
+local function wait_for_client_viewport()
+    if client_viewport_ready() then
+        start_client()
+        return
+    end
+
+    if client_viewport_waits >= CLIENT_VIEWPORT_MAX_WAITS then
+        log("No client viewport detected after 10 seconds; dedicated/headless process detected, PBQB disabled")
+        return
+    end
+
+    if client_viewport_waits == 0 then
+        log("Waiting for client viewport before initializing input and UI hooks")
+    end
+
+    client_viewport_waits = client_viewport_waits + 1
+    ExecuteWithDelay(1000, wait_for_client_viewport)
+end
+
+wait_for_client_viewport()
