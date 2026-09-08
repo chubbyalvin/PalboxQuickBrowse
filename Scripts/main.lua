@@ -1,5 +1,5 @@
 local TAG = "[PalboxQuickBrowse]"
-local VERSION = "2.1"
+local VERSION = "2.1.1"
 
 
 local PB_HOVER_FN = "/Game/Pal/Blueprint/UI/PalStorage/WBP_PalStorageMenu.WBP_PalStorageMenu_C:BndEvt__WBP_PalStorageMenu_WBP_IngameMenu_PalBox_K2Node_ComponentBoundEvent_1_OnHoveredBoxSlot__DelegateSignature"
@@ -70,6 +70,8 @@ end
 local PB = {
     palbox_container = nil,
     active_container = nil,
+    context_kind = nil,
+    context_container_name = nil,
     current_handle = nil,
     suppress_setup = false,
     details_open = false,
@@ -103,8 +105,30 @@ local PT = {
     ui = new_ui_state(),
 }
 
+-- Diagnostic-only active detail context. This does not participate in
+-- navigation decisions; it only makes PB/PT/BP handoffs explicit in logs.
+local LAST_DETAIL_CONTEXT = nil
+
 local function log(msg)
     print(string.format("%s %s\n", TAG, tostring(msg)))
+end
+
+local function log_context_handoff(next_context, reason)
+    if type(next_context) ~= "string" or next_context == "" then return end
+    if LAST_DETAIL_CONTEXT == next_context then return end
+
+    if LAST_DETAIL_CONTEXT ~= nil then
+        log(string.format(
+            "Context handoff %s -> %s reason=%s",
+            LAST_DETAIL_CONTEXT, next_context, tostring(reason or "unknown")
+        ))
+    else
+        log(string.format(
+            "Context entered %s reason=%s",
+            next_context, tostring(reason or "unknown")
+        ))
+    end
+    LAST_DETAIL_CONTEXT = next_context
 end
 
 local function valid(obj)
@@ -354,13 +378,13 @@ local function refresh_target(state, target_handle, source)
     end
 
 
-    if not valid(capture) and state == PT and PT.details_open then
+    if not valid(capture) and state.details_open then
         local ok_find, found = pcall(function()
             return FindFirstOf("BP_PalMonsterCaptureSet_C")
         end)
         if ok_find and valid(found) then
             capture = found
-            PT.capture_set = found
+            state.capture_set = found
         end
     end
 
@@ -833,9 +857,75 @@ local function pb_find_container(handle)
     return nil
 end
 
+local function pb_container_has_base_signature(container)
+    local current = container
+    for _ = 1, 10 do
+        if not valid(current) then break end
+        local name = string.lower(full_name(current))
+        if string.find(name, "basecamp", 1, true)
+            or string.find(name, "base_camp", 1, true)
+            or string.find(name, "base camp", 1, true) then
+            return true
+        end
+        current = get_outer(current)
+    end
+    return false
+end
+
+local function pb_context_kind(container)
+    if not valid(container) then return "unknown" end
+    if valid(PB.palbox_container) and same_object(container, PB.palbox_container) then
+        return "palbox"
+    end
+    if pb_container_has_base_signature(container) then
+        return "base"
+    end
+    -- The Palbox hover delegate records the main storage container. Inside
+    -- WBP_PalStorageMenu, a different non-Party character container is the
+    -- Base Pals list even when its owning UObject names are opaque.
+    if valid(PB.palbox_container) then
+        return "base"
+    end
+    return "other"
+end
+
+local function pb_log_context(container, reason, handle)
+    if not valid(container) then return "unknown" end
+    local kind = pb_context_kind(container)
+    local name = full_name(container)
+    local changed = kind ~= PB.context_kind or name ~= PB.context_container_name
+    PB.context_kind = kind
+    PB.context_container_name = name
+
+    local context_label = kind == "base" and "BP" or "PB"
+    log_context_handoff(context_label, reason)
+    if not changed then return kind end
+
+    local count = container_num(container)
+    local _, pal_id = pal_id_from_handle(handle or PB.current_handle)
+    if kind == "base" then
+        log(string.format(
+            "BP entered Base Pals slots=%s pal=%s reason=%s container=%s",
+            tostring(count or "?"), tostring(pal_id or "?"), tostring(reason or "unknown"), name
+        ))
+    elseif kind == "palbox" then
+        log(string.format(
+            "PB entered Main Palbox slots=%s pal=%s reason=%s container=%s",
+            tostring(count or "?"), tostring(pal_id or "?"), tostring(reason or "unknown"), name
+        ))
+    else
+        log(string.format(
+            "PB entered non-Party container kind=%s slots=%s pal=%s reason=%s container=%s",
+            tostring(kind), tostring(count or "?"), tostring(pal_id or "?"), tostring(reason or "unknown"), name
+        ))
+    end
+    return kind
+end
+
 local function pb_resolve_current_slot()
     PB.active_container = pb_find_container(PB.current_handle)
     if not valid(PB.active_container) then return nil end
+    pb_log_context(PB.active_container, "resolve", PB.current_handle)
 
     local slot = container_find(PB.active_container, PB.current_handle)
     if valid(slot) then return slot end
@@ -967,6 +1057,8 @@ local function pb_close_details()
     PB.popup_seen_open = false
     PB.nickname_editing = false
     PB.active_container = nil
+    PB.context_kind = nil
+    PB.context_container_name = nil
     PB.current_handle = nil
     PB.suppress_setup = false
     PB.status_widget = nil
@@ -1075,8 +1167,21 @@ local function pb_navigate(direction)
     PB.status_widget = widget
     PB.pal_panel = valid(PB.pal_panel) and PB.pal_panel or find_pal_panel_for_status(widget)
 
+    local context_kind = pb_context_kind(PB.active_container)
+    if context_kind == "base" then
+        local target_slot = container_find(PB.active_container, target_handle)
+        local target_index = slot_index(target_slot)
+        local count = container_num(PB.active_container)
+        local _, pal_id = pal_id_from_handle(target_handle)
+        log(string.format(
+            "BP navigate index=%s/%s pal=%s",
+            tostring(target_index ~= nil and (target_index + 1) or "?"),
+            tostring(count or "?"),
+            tostring(pal_id or "?")
+        ))
+    end
 
-    refresh_target(PB, target_handle, "PB")
+    refresh_target(PB, target_handle, context_kind == "base" and "BP" or "PB")
     pb_update_control_visibility()
     return true
 end
@@ -1084,6 +1189,38 @@ end
 
 local function party_handle_key(handle)
     return valid(handle) and full_name(handle) or ""
+end
+
+-- Palworld 1.0.4 can hand the status page a different IndividualHandle UObject
+-- for the same Pal than the live Party holder exposes. Compare the underlying
+-- IndividualParameter native identity first; fall back to the handle path.
+local function party_parameter_identity(handle)
+    if not valid(handle) then return nil end
+    local ok, first, second = pcall(function()
+        return handle:TryGetIndividualParameter()
+    end)
+    if not ok then return nil end
+
+    local parameter = unwrap(first)
+    if not valid(parameter) then parameter = unwrap(second) end
+    if not valid(parameter) then return nil end
+
+    local ok_address, address = pcall(function() return parameter:GetAddress() end)
+    if ok_address and type(address) == "number" and address ~= 0 then
+        return "addr:" .. tostring(address)
+    end
+
+    local name = full_name(parameter)
+    if name ~= "" then return "name:" .. name end
+    return nil
+end
+
+local function party_same_individual(a, b)
+    if not valid(a) or not valid(b) then return false end
+    local a_id = party_parameter_identity(a)
+    local b_id = party_parameter_identity(b)
+    if a_id ~= nil and b_id ~= nil then return a_id == b_id end
+    return party_handle_key(a) == party_handle_key(b)
 end
 
 local function party_owner_controller(widget)
@@ -1108,10 +1245,9 @@ local function party_holder(widget)
 end
 
 local function party_find_index(handle)
-    local key = party_handle_key(handle)
-    if key == "" then return nil end
+    if not valid(handle) then return nil end
     for i, h in ipairs(PT.handles) do
-        if party_handle_key(h) == key then return i end
+        if party_same_individual(h, handle) then return i end
     end
     return nil
 end
@@ -1131,7 +1267,7 @@ local function party_refresh_native_roster(reason)
         return false
     end
 
-    local current_key = party_handle_key(PT.current_handle)
+    local current_handle = PT.current_handle
 
     local handles = {}
     local native_slots = {}
@@ -1154,9 +1290,9 @@ local function party_refresh_native_roster(reason)
     PT.native_slots = native_slots
     PT.current_index = nil
 
-    if current_key ~= "" then
+    if valid(current_handle) then
         for i, handle in ipairs(PT.handles) do
-            if party_handle_key(handle) == current_key then
+            if party_same_individual(handle, current_handle) then
                 PT.current_index = i
                 PT.current_handle = handle
                 break
@@ -1205,6 +1341,7 @@ local function party_enter_details(context, handle, source)
     if valid(ctx) then PT.party_widget = ctx end
     if not valid(target) then return end
 
+    log_context_handoff("PT", source or "enter_details")
     party_refresh_native_roster("enter_details")
     local idx = party_find_index(target)
     if idx == nil then
@@ -1267,8 +1404,18 @@ local function party_navigate(direction)
     end
 
     local target_handle = PT.handles[target_index]
-    if not valid(target_handle) or not valid(PT.party_widget) then
-        log("PT navigation failed: target/widget unavailable")
+    if not valid(target_handle) then
+        log("PT navigation failed: target unavailable")
+        return false
+    end
+
+    local bind_widget = PT.party_widget
+    if not valid(bind_widget) and valid(PT.status_widget) then
+        bind_widget = find_pal_panel_for_status(PT.status_widget)
+        if valid(bind_widget) then PT.party_widget = bind_widget end
+    end
+    if not valid(bind_widget) then
+        log("PT navigation failed: Party bind widget unavailable")
         return false
     end
 
@@ -1276,7 +1423,7 @@ local function party_navigate(direction)
     local serial = PT.nav_serial
 
     local ok, err = pcall(function()
-        PT.party_widget["BindFromHandle"](PT.party_widget, target_handle)
+        bind_widget["BindFromHandle"](bind_widget, target_handle)
     end)
     if not ok then
         log("PT BindFromHandle error: " .. tostring(err))
@@ -1434,21 +1581,44 @@ install_hooks = function()
                 local handle = unwrap(CharacterHandle)
                 local status = unwrap(context)
 
+                if not valid(handle) then return end
 
-                local belongs_to_party_status = false
-                if PT.details_open and valid(status) then
-                    if valid(PT.status_widget) and same_object(status, PT.status_widget) then
-                        belongs_to_party_status = true
-                    elseif valid(PT.party_widget) and belongs_to(PT.party_widget, status) then
-                        belongs_to_party_status = true
-                    end
+                -- 1.0.4 compatibility: the old Party ListToStatus/ToStatus callbacks
+                -- are no longer reliable. Classify Setup One Pal directly against
+                -- the live Party roster using IndividualParameter identity.
+                local party_index = nil
+                if party_refresh_native_roster("setup_one_classify") then
+                    party_index = party_find_index(handle)
                 end
 
-                if belongs_to_party_status then
-                    PT.status_widget = status
+                if party_index ~= nil then
+                    if PB.details_open then
+                        pb_close_details()
+                    end
+                    log_context_handoff("PT", "SetupOne Party recovery")
+
+                    PT.current_index = party_index
+                    PT.current_handle = PT.handles[party_index] or handle
+                    PT.details_open = true
+                    PT.nickname_editing = false
+                    PT.status_widget = valid(status) and status or find_details_widget()
+
+                    local recovered_panel = find_pal_panel_for_status(PT.status_widget)
+                    if valid(recovered_panel) then PT.party_widget = recovered_panel end
+
+                    PT.input_mode = detect_input_mode(PT.input_mode)
+                    if not valid(PT.ui.overlay) then ui_build(PT) end
+                    ui_update_labels(PT, PT.input_mode)
+                    ui_set_visible(PB, false)
+                    ui_set_visible(PT, true)
+                    party_update_control_visibility()
+
+                    log(string.format(
+                        "PT recovered from Setup One Pal via live Party identity index=%d/%d widget=%s",
+                        party_index, #PT.handles, tostring(valid(PT.party_widget))
+                    ))
                     return
                 end
-
 
                 if PT.details_open then
                     party_leave_details()
@@ -1456,7 +1626,7 @@ install_hooks = function()
 
                 if PB.suppress_setup then
                     PB.suppress_setup = false
-                    if valid(handle) then PB.current_handle = handle end
+                    PB.current_handle = handle
                     if valid(status) then
                         PB.status_widget = status
                         PB.pal_panel = find_pal_panel_for_status(status)
@@ -1465,11 +1635,11 @@ install_hooks = function()
                     return
                 end
 
-                if not valid(handle) then return end
-
-
                 PB.current_handle = handle
-                PB.active_container = nil
+                PB.active_container = pb_find_container(handle)
+                if valid(PB.active_container) then
+                    pb_log_context(PB.active_container, "SetupOne", handle)
+                end
                 PB.status_widget = valid(status) and status or find_details_widget()
                 PB.pal_panel = find_pal_panel_for_status(PB.status_widget)
                 PB.capture_set = nil
@@ -1497,20 +1667,12 @@ install_hooks = function()
                 if not valid(capture) then return end
 
 
+                -- 1.0.4 changed the transient widget ownership chain, so the
+                -- renderer no longer reliably appears beneath WBP_PalStatus. The
+                -- active detail context is sufficient to own the current capture.
                 if PT.details_open then
-                    if (valid(PT.status_widget) and belongs_to(renderer, PT.status_widget))
-                        or not valid(PT.capture_set)
-                    then
-                        PT.capture_set = capture
-                        if not valid(PT.status_widget) or not belongs_to(renderer, PT.status_widget) then
-                        end
-                    end
-                elseif PB.details_open
-                    and valid(PB.status_widget)
-                    and belongs_to(renderer, PB.status_widget)
-                then
-
-
+                    PT.capture_set = capture
+                elseif PB.details_open then
                     PB.capture_set = capture
                 end
             end, function() end)
@@ -1638,7 +1800,7 @@ local function start_client()
         end)
     end
 
-    log("Palbox Quick Browse v" .. VERSION .. " loaded")
+    log("Palbox Quick Browse v" .. VERSION .. " loaded; 1.0.4 Party identity recovery + capture fallback + PB/PT/BP context and handoff diagnostics enabled")
     if not left_arrow_ok then log("Left Arrow binding unavailable: " .. tostring(left_arrow_err)) end
     if not right_arrow_ok then log("Right Arrow binding unavailable: " .. tostring(right_arrow_err)) end
     if not mouse_ok then log("Mouse binding unavailable: " .. tostring(mouse_err)) end
