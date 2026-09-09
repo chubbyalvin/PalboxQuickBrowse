@@ -1,5 +1,5 @@
 local TAG = "[PalboxQuickBrowse]"
-local VERSION = "2.1.1"
+local VERSION = "2.1.2"
 
 
 local PB_HOVER_FN = "/Game/Pal/Blueprint/UI/PalStorage/WBP_PalStorageMenu.WBP_PalStorageMenu_C:BndEvt__WBP_PalStorageMenu_WBP_IngameMenu_PalBox_K2Node_ComponentBoundEvent_1_OnHoveredBoxSlot__DelegateSignature"
@@ -98,6 +98,7 @@ local PT = {
     details_open = false,
     nickname_editing = false,
     status_widget = nil,
+    details_popup = nil,
     capture_set = nil,
     nav_serial = 0,
     last_nav_clock = -1000.0,
@@ -105,30 +106,8 @@ local PT = {
     ui = new_ui_state(),
 }
 
--- Diagnostic-only active detail context. This does not participate in
--- navigation decisions; it only makes PB/PT/BP handoffs explicit in logs.
-local LAST_DETAIL_CONTEXT = nil
-
 local function log(msg)
     print(string.format("%s %s\n", TAG, tostring(msg)))
-end
-
-local function log_context_handoff(next_context, reason)
-    if type(next_context) ~= "string" or next_context == "" then return end
-    if LAST_DETAIL_CONTEXT == next_context then return end
-
-    if LAST_DETAIL_CONTEXT ~= nil then
-        log(string.format(
-            "Context handoff %s -> %s reason=%s",
-            LAST_DETAIL_CONTEXT, next_context, tostring(reason or "unknown")
-        ))
-    else
-        log(string.format(
-            "Context entered %s reason=%s",
-            next_context, tostring(reason or "unknown")
-        ))
-    end
-    LAST_DETAIL_CONTEXT = next_context
 end
 
 local function valid(obj)
@@ -303,6 +282,39 @@ local function find_pal_panel_for_status(status)
     return nil
 end
 
+
+local function adopt_status_authority(state, status, source)
+    if type(state) ~= "table" or not valid(status) then return nil end
+
+    local incoming_popup = find_popup_ancestor(status)
+    local previous_status = state.status_widget
+    local previous_popup = state.details_popup
+
+    if valid(previous_status) and not same_object(previous_status, status) then
+        local previous_visible = valid(previous_popup) and popup_visible(previous_popup)
+        local incoming_visible = valid(incoming_popup) and popup_visible(incoming_popup)
+        if previous_visible and not incoming_visible then
+            return find_pal_panel_for_status(previous_status)
+        end
+    end
+
+    local changed = not same_object(previous_status, status)
+    if changed then
+        state.capture_set = nil
+    end
+
+    state.status_widget = status
+    state.details_popup = valid(incoming_popup) and incoming_popup or nil
+    local panel = find_pal_panel_for_status(status)
+    if state == PB then
+        PB.pal_panel = panel
+    elseif state == PT and valid(panel) then
+        PT.party_widget = panel
+    end
+
+    return panel
+end
+
 local function try_capture_from_status(status)
     if not valid(status) then return nil end
 
@@ -342,12 +354,243 @@ local function pal_id_from_handle(handle)
 end
 
 
-local function refresh_target(state, target_handle, source)
-    local pal_id, pal_id_string = pal_id_from_handle(target_handle)
-    if pal_id == nil then
-        log(source .. " refresh skipped: PalID unavailable")
+local function native_rebind_panel(panel, target_handle, source)
+    if not valid(panel) or not valid(target_handle) then
         return false, false, false
     end
+
+    local unbind_attempted = false
+    local unbind_ok = false
+    local unbind_err = nil
+    local ok_get_unbind, unbind_fn = pcall(function() return panel["Unbind"] end)
+    if ok_get_unbind and unbind_fn ~= nil then
+        unbind_attempted = true
+        local ok_unbind, err_unbind = pcall(function()
+            unbind_fn(panel)
+        end)
+        unbind_ok = ok_unbind
+        unbind_err = err_unbind
+    end
+
+    local bind_ok, bind_err = pcall(function()
+        panel["BindFromHandle"](panel, target_handle)
+    end)
+
+
+    if unbind_attempted and not unbind_ok then
+        log(source .. " Unbind error (continuing with BindFromHandle): " .. tostring(unbind_err))
+    end
+    if not bind_ok then
+        log(source .. " BindFromHandle error: " .. tostring(bind_err))
+    end
+
+    return bind_ok, unbind_attempted, unbind_ok
+end
+
+
+local function normalized_display_text(value)
+    if value == nil or type(value) == "boolean" then return nil end
+
+    local function clean(candidate)
+        if type(candidate) ~= "string" then return nil end
+        candidate = candidate:gsub("^%s+", ""):gsub("%s+$", "")
+        if candidate == "" or candidate == "None" or candidate == "nil" then return nil end
+        if candidate:match("^FText[%s:]") or candidate:match("^RemoteUnrealParam[%s:]") then
+            return nil
+        end
+        return candidate
+    end
+
+    local text = clean(value)
+    if text ~= nil then return text end
+
+    local ok, converted = pcall(function() return value:GetDisplayString() end)
+    text = ok and clean(converted) or nil
+    if text ~= nil then return text end
+
+    ok, converted = pcall(function() return value:ToString() end)
+    text = ok and clean(converted) or nil
+    if text ~= nil then return text end
+
+    local unwrapped = unwrap(value)
+    text = clean(unwrapped)
+    if text ~= nil then return text end
+
+    if unwrapped ~= value and unwrapped ~= nil then
+        ok, converted = pcall(function() return unwrapped:GetDisplayString() end)
+        text = ok and clean(converted) or nil
+        if text ~= nil then return text end
+
+        ok, converted = pcall(function() return unwrapped:ToString() end)
+        text = ok and clean(converted) or nil
+        if text ~= nil then return text end
+    end
+
+    return nil
+end
+
+local function partner_skill_name_for_pal(pal_id, world_context)
+    if pal_id == nil or not valid(world_context) then
+        return nil, "missing PalID/world context"
+    end
+
+    local ui = get_class("/Script/Pal.Default__PalUIUtility")
+    if not valid(ui) then return nil, "PalUIUtility unavailable" end
+
+    local out = {}
+    local ok, first, second, third = pcall(function()
+        return ui:GetPartnerSkillName(world_context, pal_id, out)
+    end)
+    if not ok then return nil, "GetPartnerSkillName error: " .. tostring(first) end
+
+    local function first_text(...)
+        for index = 1, select("#", ...) do
+            local text = normalized_display_text(select(index, ...))
+            if text ~= nil then return text end
+        end
+        return nil
+    end
+
+    local text = first_text(first, second, third)
+    if text ~= nil then return text, nil end
+    for _, value in pairs(out) do
+        text = normalized_display_text(value)
+        if text ~= nil then return text, nil end
+    end
+
+    return nil, "localized Partner Skill name unavailable"
+end
+
+local function find_widget_descendant(root, wanted_name)
+    root = unwrap(root)
+    if not valid(root) or type(wanted_name) ~= "string" then return nil end
+
+    local stack = { root }
+    local visited = {}
+    local inspected = 0
+    while #stack > 0 and inspected < 256 do
+        local widget = unwrap(table.remove(stack))
+        if valid(widget) then
+            local identity = full_name(widget)
+            if identity == "" or not visited[identity] then
+                if identity ~= "" then visited[identity] = true end
+                inspected = inspected + 1
+
+                local ok_name, object_name = pcall(function()
+                    return widget:GetFName():ToString()
+                end)
+                object_name = ok_name and tostring(object_name or "") or ""
+                if object_name == wanted_name
+                    or object_name:match("^" .. wanted_name .. "_") then
+                    return widget
+                end
+
+                local ok_count, count = pcall(function()
+                    return widget:GetChildrenCount()
+                end)
+                if ok_count and type(count) == "number" and count > 0 then
+                    for index = count - 1, 0, -1 do
+                        local ok_child, child = pcall(function()
+                            return unwrap(widget:GetChildAt(index))
+                        end)
+                        if ok_child and valid(child) then stack[#stack + 1] = child end
+                    end
+                end
+            end
+        end
+    end
+
+    return nil
+end
+
+local function widget_tree_root(owner)
+    if not valid(owner) then return nil, nil end
+    local tree = field(owner, "WidgetTree")
+    if not valid(tree) then return nil, nil end
+
+    local root = field(tree, "RootWidget")
+    if valid(root) then return root, tree end
+
+    return nil, tree
+end
+
+local function find_widget_tree_descendant(owner, wanted_name)
+    local root = widget_tree_root(owner)
+    if not valid(root) then return nil end
+    return find_widget_descendant(root, wanted_name)
+end
+
+
+local function find_named_widget(owner, name)
+    if not valid(owner) or type(name) ~= "string" then return nil, "none" end
+
+    local tree_descendant = find_widget_tree_descendant(owner, name)
+    if valid(tree_descendant) then return tree_descendant, "WidgetTree" end
+
+    local direct = field(owner, name)
+    if valid(direct) then return direct, "field" end
+
+    local key = nil
+    if FName ~= nil then
+        local ok_name, value = pcall(FName, name)
+        if ok_name then key = value end
+    end
+
+    if key ~= nil then
+        local tree = field(owner, "WidgetTree")
+        if valid(tree) then
+            local ok, found = pcall(function() return unwrap(tree:FindWidget(key)) end)
+            if ok and valid(found) then return found, "WidgetTree.FindWidget" end
+        end
+
+        local ok, found = pcall(function() return unwrap(owner:GetWidgetFromName(key)) end)
+        if ok and valid(found) then return found, "GetWidgetFromName" end
+    end
+
+    local descendant = find_widget_descendant(owner, name)
+    if valid(descendant) then return descendant, "owner-descendant" end
+    return nil, "none"
+end
+
+local function refresh_partner_skill_name(panel, status_widget, pal_id)
+    if not valid(panel) or pal_id == nil then return false end
+
+    local context = valid(status_widget) and status_widget or panel
+    local name = partner_skill_name_for_pal(pal_id, context)
+    if name == nil then return false end
+
+    local rich_widget = find_named_widget(panel, "RichText_PartnerSkillName")
+    local plain_widget = find_named_widget(panel, "Text_PartnerSkillName_1")
+    if not valid(rich_widget) and not valid(plain_widget) then return false end
+
+    local ok_text, text_value = pcall(FText, name)
+    if not ok_text or text_value == nil then return false end
+
+    local rich_verified = false
+    local plain_verified = false
+
+    if valid(rich_widget) then
+        local ok_set = pcall(function() rich_widget:SetText(text_value) end)
+        if ok_set then
+            local ok_get, value = pcall(function() return rich_widget:GetText() end)
+            rich_verified = ok_get and normalized_display_text(value) == name
+        end
+    end
+
+    if valid(plain_widget) then
+        local ok_set = pcall(function() plain_widget:SetText(text_value) end)
+        if ok_set then
+            local ok_get, value = pcall(function() return plain_widget:GetText() end)
+            plain_verified = ok_get and normalized_display_text(value) == name
+        end
+    end
+
+    return rich_verified or plain_verified
+end
+
+local function refresh_target(state, target_handle, source)
+    local pal_id = pal_id_from_handle(target_handle)
+    if pal_id == nil then return false, false, false end
 
     local panel = state.pal_panel
     if not valid(panel) and state == PT then
@@ -360,6 +603,7 @@ local function refresh_target(state, target_handle, source)
 
     local lock_ok = false
     local icon_ok = false
+    local name_ok = false
     if valid(panel) then
         lock_ok = pcall(function()
             panel["SetPartnerSkillLock"](panel, pal_id)
@@ -367,8 +611,7 @@ local function refresh_target(state, target_handle, source)
         icon_ok = pcall(function()
             panel["SetPartnerSkillIcon"](panel, pal_id)
         end)
-    else
-        log(source .. " Partner Skill refresh skipped: Pal panel unavailable")
+        name_ok = refresh_partner_skill_name(panel, state.status_widget, pal_id)
     end
 
     local capture = state.capture_set
@@ -393,22 +636,9 @@ local function refresh_target(state, target_handle, source)
         capture_ok = pcall(function()
             capture["RequestCaptureFromPalID"](capture, pal_id)
         end)
-    else
-        log(source .. " 3D refresh skipped: capture actor unavailable")
     end
 
-    if not (lock_ok and icon_ok and capture_ok) then
-        log(string.format(
-            "%s refresh incomplete pal=%s lock=%s icon=%s capture=%s",
-            source,
-            tostring(pal_id_string),
-            tostring(lock_ok),
-            tostring(icon_ok),
-            tostring(capture_ok)
-        ))
-    end
-
-    return lock_ok, icon_ok, capture_ok
+    return lock_ok, icon_ok, name_ok, capture_ok
 end
 
 
@@ -880,9 +1110,6 @@ local function pb_context_kind(container)
     if pb_container_has_base_signature(container) then
         return "base"
     end
-    -- The Palbox hover delegate records the main storage container. Inside
-    -- WBP_PalStorageMenu, a different non-Party character container is the
-    -- Base Pals list even when its owning UObject names are opaque.
     if valid(PB.palbox_container) then
         return "base"
     end
@@ -897,28 +1124,6 @@ local function pb_log_context(container, reason, handle)
     PB.context_kind = kind
     PB.context_container_name = name
 
-    local context_label = kind == "base" and "BP" or "PB"
-    log_context_handoff(context_label, reason)
-    if not changed then return kind end
-
-    local count = container_num(container)
-    local _, pal_id = pal_id_from_handle(handle or PB.current_handle)
-    if kind == "base" then
-        log(string.format(
-            "BP entered Base Pals slots=%s pal=%s reason=%s container=%s",
-            tostring(count or "?"), tostring(pal_id or "?"), tostring(reason or "unknown"), name
-        ))
-    elseif kind == "palbox" then
-        log(string.format(
-            "PB entered Main Palbox slots=%s pal=%s reason=%s container=%s",
-            tostring(count or "?"), tostring(pal_id or "?"), tostring(reason or "unknown"), name
-        ))
-    else
-        log(string.format(
-            "PB entered non-Party container kind=%s slots=%s pal=%s reason=%s container=%s",
-            tostring(kind), tostring(count or "?"), tostring(pal_id or "?"), tostring(reason or "unknown"), name
-        ))
-    end
     return kind
 end
 
@@ -1014,7 +1219,6 @@ local function api_context()
         values[side .. "Slot"] = api_read(prefix .. side .. "Slot")
         values[side .. "Handle"] = api_read(prefix .. side .. "Handle")
     end
-    -- ActiveProvider is written last by the provider; Current identifies this snapshot.
     if current ~= api_read(prefix .. "Current")
         or provider ~= api_read("ActiveProvider") then return nil end
 
@@ -1026,7 +1230,7 @@ local function api_context()
         local index = values[side .. "Slot"]
         local identity = values[side .. "Handle"]
         if page == -1 and index == -1 and identity == "" then
-            context[side] = false -- Valid filtered-list boundary.
+            context[side] = false 
         else
             local handle = api_resolve(storage, page, index, identity)
             if not valid(handle) or same_object(handle, PB.current_handle) then return nil end
@@ -1113,14 +1317,6 @@ local function pb_navigate(direction)
     if not valid(target_handle) then return false end
 
 
-    local live_widget = find_details_widget()
-    if valid(live_widget) then
-        if not valid(PB.status_widget) or not same_object(PB.status_widget, live_widget) then
-            PB.status_widget = live_widget
-            PB.pal_panel = find_pal_panel_for_status(live_widget)
-            PB.capture_set = nil
-        end
-    end
 
     local widget = PB.status_widget
     if not valid(widget) then
@@ -1135,15 +1331,14 @@ local function pb_navigate(direction)
     local panel = valid(PB.pal_panel) and PB.pal_panel or find_pal_panel_for_status(widget)
     PB.pal_panel = panel
 
+
     local bind_ok = false
     if valid(panel) then
-        local ok_bind, bind_err = pcall(function()
-            panel["BindFromHandle"](panel, target_handle)
-        end)
-        if ok_bind then
-            bind_ok = true
-        else
-            log("PB BindFromHandle failed; falling back to Setup One Pal: " .. tostring(bind_err))
+        bind_ok = native_rebind_panel(
+            panel, target_handle,
+            pb_context_kind(PB.active_container) == "base" and "BP" or "PB")
+        if not bind_ok then
+            log("PB native rebind failed; falling back to Setup One Pal")
         end
     end
 
@@ -1168,19 +1363,6 @@ local function pb_navigate(direction)
     PB.pal_panel = valid(PB.pal_panel) and PB.pal_panel or find_pal_panel_for_status(widget)
 
     local context_kind = pb_context_kind(PB.active_container)
-    if context_kind == "base" then
-        local target_slot = container_find(PB.active_container, target_handle)
-        local target_index = slot_index(target_slot)
-        local count = container_num(PB.active_container)
-        local _, pal_id = pal_id_from_handle(target_handle)
-        log(string.format(
-            "BP navigate index=%s/%s pal=%s",
-            tostring(target_index ~= nil and (target_index + 1) or "?"),
-            tostring(count or "?"),
-            tostring(pal_id or "?")
-        ))
-    end
-
     refresh_target(PB, target_handle, context_kind == "base" and "BP" or "PB")
     pb_update_control_visibility()
     return true
@@ -1191,9 +1373,6 @@ local function party_handle_key(handle)
     return valid(handle) and full_name(handle) or ""
 end
 
--- Palworld 1.0.4 can hand the status page a different IndividualHandle UObject
--- for the same Pal than the live Party holder exposes. Compare the underlying
--- IndividualParameter native identity first; fall back to the handle path.
 local function party_parameter_identity(handle)
     if not valid(handle) then return nil end
     local ok, first, second = pcall(function()
@@ -1311,6 +1490,7 @@ local function party_leave_details()
     PT.current_handle = nil
     PT.nickname_editing = false
     PT.status_widget = nil
+    PT.details_popup = nil
     PT.capture_set = nil
     PT.nav_serial = PT.nav_serial + 1
     ui_set_visible(PT, false)
@@ -1327,6 +1507,7 @@ local function party_begin_session(context)
     PT.details_open = false
     PT.nickname_editing = false
     PT.status_widget = nil
+    PT.details_popup = nil
     PT.capture_set = nil
     PT.nav_serial = PT.nav_serial + 1
     ui_set_visible(PT, false)
@@ -1341,7 +1522,6 @@ local function party_enter_details(context, handle, source)
     if valid(ctx) then PT.party_widget = ctx end
     if not valid(target) then return end
 
-    log_context_handoff("PT", source or "enter_details")
     party_refresh_native_roster("enter_details")
     local idx = party_find_index(target)
     if idx == nil then
@@ -1356,9 +1536,10 @@ local function party_enter_details(context, handle, source)
     PT.current_handle = target
     PT.details_open = true
     PT.nickname_editing = false
-    PT.status_widget = find_status_ancestor(PT.party_widget)
-    if not valid(PT.status_widget) then
-        PT.status_widget = find_details_widget()
+    local entered_status = find_status_ancestor(PT.party_widget)
+    if not valid(entered_status) then entered_status = find_details_widget() end
+    if valid(entered_status) then
+        adopt_status_authority(PT, entered_status, "PT " .. tostring(source or "enter_details"))
     end
 
     PT.input_mode = detect_input_mode(PT.input_mode)
@@ -1409,6 +1590,7 @@ local function party_navigate(direction)
         return false
     end
 
+
     local bind_widget = PT.party_widget
     if not valid(bind_widget) and valid(PT.status_widget) then
         bind_widget = find_pal_panel_for_status(PT.status_widget)
@@ -1422,11 +1604,9 @@ local function party_navigate(direction)
     PT.nav_serial = PT.nav_serial + 1
     local serial = PT.nav_serial
 
-    local ok, err = pcall(function()
-        bind_widget["BindFromHandle"](bind_widget, target_handle)
-    end)
+
+    local ok = native_rebind_panel(bind_widget, target_handle, "PT")
     if not ok then
-        log("PT BindFromHandle error: " .. tostring(err))
         return false
     end
 
@@ -1518,6 +1698,22 @@ local function schedule_retry()
     end)
 end
 
+
+local SETUP_SYNC_STACK = {}
+
+local function sync_partner_skill_after_setup(pending)
+    if type(pending) ~= "table" then return end
+    local status = pending.status
+    local handle = pending.handle
+    if not valid(status) or not valid(handle) then return end
+
+    local panel = find_pal_panel_for_status(status)
+    local pal_id = pal_id_from_handle(handle)
+    if not valid(panel) or pal_id == nil then return end
+
+    refresh_partner_skill_name(panel, status, pal_id)
+end
+
 install_hooks = function()
     if hook_install_attempts >= HOOK_INSTALL_MAX_ATTEMPTS then return end
     hook_install_attempts = hook_install_attempts + 1
@@ -1581,29 +1777,34 @@ install_hooks = function()
                 local handle = unwrap(CharacterHandle)
                 local status = unwrap(context)
 
+                local pending = { status = status, handle = handle, source = "SetupOne" }
+                table.insert(SETUP_SYNC_STACK, pending)
                 if not valid(handle) then return end
 
-                -- 1.0.4 compatibility: the old Party ListToStatus/ToStatus callbacks
-                -- are no longer reliable. Classify Setup One Pal directly against
-                -- the live Party roster using IndividualParameter identity.
                 local party_index = nil
                 if party_refresh_native_roster("setup_one_classify") then
                     party_index = party_find_index(handle)
                 end
 
                 if party_index ~= nil then
-                    if PB.details_open then
-                        pb_close_details()
-                    end
-                    log_context_handoff("PT", "SetupOne Party recovery")
+                    pending.source = "PT SetupOne"
+                    if PB.details_open then pb_close_details() end
 
                     PT.current_index = party_index
                     PT.current_handle = PT.handles[party_index] or handle
                     PT.details_open = true
                     PT.nickname_editing = false
-                    PT.status_widget = valid(status) and status or find_details_widget()
+                    if valid(status) then
+                        adopt_status_authority(PT, status, "PT SetupOne")
+                    elseif not valid(PT.status_widget) then
+                        local fallback = find_details_widget()
+                        if valid(fallback) then
+                            adopt_status_authority(PT, fallback, "PT SetupOne fallback")
+                        end
+                    end
 
-                    local recovered_panel = find_pal_panel_for_status(PT.status_widget)
+                    local recovered_panel = valid(PT.status_widget)
+                        and find_pal_panel_for_status(PT.status_widget) or nil
                     if valid(recovered_panel) then PT.party_widget = recovered_panel end
 
                     PT.input_mode = detect_input_mode(PT.input_mode)
@@ -1613,37 +1814,39 @@ install_hooks = function()
                     ui_set_visible(PT, true)
                     party_update_control_visibility()
 
-                    log(string.format(
-                        "PT recovered from Setup One Pal via live Party identity index=%d/%d widget=%s",
-                        party_index, #PT.handles, tostring(valid(PT.party_widget))
-                    ))
                     return
                 end
 
-                if PT.details_open then
-                    party_leave_details()
-                end
+                if PT.details_open then party_leave_details() end
 
                 if PB.suppress_setup then
+                    pending.source = "PB SetupOne fallback"
                     PB.suppress_setup = false
                     PB.current_handle = handle
                     if valid(status) then
-                        PB.status_widget = status
-                        PB.pal_panel = find_pal_panel_for_status(status)
+                        adopt_status_authority(PB, status, "PB SetupOne fallback")
                     end
                     pb_update_control_visibility()
                     return
                 end
 
+                pending.source = "PB SetupOne"
                 PB.current_handle = handle
                 PB.active_container = pb_find_container(handle)
                 if valid(PB.active_container) then
                     pb_log_context(PB.active_container, "SetupOne", handle)
                 end
-                PB.status_widget = valid(status) and status or find_details_widget()
-                PB.pal_panel = find_pal_panel_for_status(PB.status_widget)
+
+                if valid(status) then
+                    adopt_status_authority(PB, status, "PB SetupOne")
+                elseif not valid(PB.status_widget) then
+                    local fallback = find_details_widget()
+                    if valid(fallback) then
+                        adopt_status_authority(PB, fallback, "PB SetupOne fallback")
+                    end
+                end
+
                 PB.capture_set = nil
-                PB.details_popup = find_popup_ancestor(context)
                 PB.popup_seen_open = false
                 PB.details_open = true
                 PB.nickname_editing = false
@@ -1655,7 +1858,10 @@ install_hooks = function()
                 ui_set_visible(PT, false)
                 ui_set_visible(PB, true)
                 pb_update_control_visibility()
-            end, function() end)
+            end, function()
+                local pending = table.remove(SETUP_SYNC_STACK)
+                sync_partner_skill_after_setup(pending)
+            end)
         end)
     end
 
@@ -1666,10 +1872,6 @@ install_hooks = function()
                 local capture = unwrap(CaptureActor)
                 if not valid(capture) then return end
 
-
-                -- 1.0.4 changed the transient widget ownership chain, so the
-                -- renderer no longer reliably appears beneath WBP_PalStatus. The
-                -- active detail context is sufficient to own the current capture.
                 if PT.details_open then
                     PT.capture_set = capture
                 elseif PB.details_open then
@@ -1800,7 +2002,7 @@ local function start_client()
         end)
     end
 
-    log("Palbox Quick Browse v" .. VERSION .. " loaded; 1.0.4 Party identity recovery + capture fallback + PB/PT/BP context and handoff diagnostics enabled")
+    log("Palbox Quick Browse v" .. VERSION .. " loaded")
     if not left_arrow_ok then log("Left Arrow binding unavailable: " .. tostring(left_arrow_err)) end
     if not right_arrow_ok then log("Right Arrow binding unavailable: " .. tostring(right_arrow_err)) end
     if not mouse_ok then log("Mouse binding unavailable: " .. tostring(mouse_err)) end
