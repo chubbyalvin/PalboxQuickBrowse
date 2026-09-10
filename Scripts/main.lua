@@ -1,5 +1,5 @@
 local TAG = "[PalboxQuickBrowse]"
-local VERSION = "2.1.2"
+local VERSION = "2.1.3"
 
 
 local PB_HOVER_FN = "/Game/Pal/Blueprint/UI/PalStorage/WBP_PalStorageMenu.WBP_PalStorageMenu_C:BndEvt__WBP_PalStorageMenu_WBP_IngameMenu_PalBox_K2Node_ComponentBoundEvent_1_OnHoveredBoxSlot__DelegateSignature"
@@ -387,6 +387,27 @@ local function native_rebind_panel(panel, target_handle, source)
     return bind_ok, unbind_attempted, unbind_ok
 end
 
+
+local INTERNAL_STATUS_REFRESH = false
+
+local function native_refresh_status(status_widget, target_handle, source)
+    if not valid(status_widget) or not valid(target_handle) then
+        return false
+    end
+
+    local ok, err = pcall(function()
+        INTERNAL_STATUS_REFRESH = true
+        status_widget["Setup One Pal"](status_widget, target_handle, true)
+    end)
+    INTERNAL_STATUS_REFRESH = false
+
+    if not ok then
+        log(source .. " status refresh via Setup One Pal failed: " .. tostring(err))
+        return false
+    end
+
+    return true
+end
 
 local function normalized_display_text(value)
     if value == nil or type(value) == "boolean" then return nil end
@@ -1354,6 +1375,8 @@ local function pb_navigate(direction)
             log("PB navigation failed on both bind paths: " .. tostring(setup_err))
             return false
         end
+    else
+        native_refresh_status(widget, target_handle, "PB")
     end
 
     if serial ~= PB.nav_serial then return true end
@@ -1610,6 +1633,15 @@ local function party_navigate(direction)
         return false
     end
 
+    local refresh_status = PT.status_widget
+    if not valid(refresh_status) then
+        refresh_status = find_status_ancestor(bind_widget)
+        if valid(refresh_status) then PT.status_widget = refresh_status end
+    end
+    if valid(refresh_status) then
+        native_refresh_status(refresh_status, target_handle, "PT")
+    end
+
     if serial ~= PT.nav_serial then return true end
 
     PT.current_index = target_index
@@ -1780,6 +1812,11 @@ install_hooks = function()
                 local pending = { status = status, handle = handle, source = "SetupOne" }
                 table.insert(SETUP_SYNC_STACK, pending)
                 if not valid(handle) then return end
+
+                if INTERNAL_STATUS_REFRESH then
+                    pending.source = "Internal status refresh"
+                    return
+                end
 
                 local party_index = nil
                 if party_refresh_native_roster("setup_one_classify") then
