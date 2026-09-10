@@ -1,5 +1,5 @@
 local TAG = "[PalboxQuickBrowse]"
-local VERSION = "2.1.3"
+local VERSION = "2.1.4"
 
 
 local PB_HOVER_FN = "/Game/Pal/Blueprint/UI/PalStorage/WBP_PalStorageMenu.WBP_PalStorageMenu_C:BndEvt__WBP_PalStorageMenu_WBP_IngameMenu_PalBox_K2Node_ComponentBoundEvent_1_OnHoveredBoxSlot__DelegateSignature"
@@ -10,6 +10,7 @@ local PARTY_SET_HANDLES_FN = "/Game/Pal/Blueprint/UI/UserInterface/MainMenu/Pal/
 local PARTY_LIST_TO_STATUS_FN = "/Game/Pal/Blueprint/UI/UserInterface/MainMenu/Pal/WBP_MainMenu_Pal_00.WBP_MainMenu_Pal_00_C:ListToStatus"
 local PARTY_TO_STATUS_FN = "/Game/Pal/Blueprint/UI/UserInterface/MainMenu/Pal/WBP_MainMenu_Pal_00.WBP_MainMenu_Pal_00_C:AnmEvent_ToStatus_WithSetup"
 local PARTY_FOCUS_PANEL_FN = "/Game/Pal/Blueprint/UI/UserInterface/MainMenu/Pal/WBP_MainMenu_Pal_00.WBP_MainMenu_Pal_00_C:FocusToPalPanel"
+local PARTY_SKILL_OPEN_FN = "/Game/Pal/Blueprint/UI/UserInterface/MainMenu/Pal/WBP_MainMenu_Pal_00.WBP_MainMenu_Pal_00_C:OpenChangeActiveSkillList"
 
 
 local STATUS_SETUP_ONE_FN = "/Game/Pal/Blueprint/UI/PalStatus/WBP_PalStatus.WBP_PalStatus_C:Setup One Pal"
@@ -44,6 +45,7 @@ local hooks_ready = {
     party_list = false,
     party_to_status = false,
     party_focus_panel = false,
+    party_skill_open = false,
     cancel = false,
     name_open = false,
     name_close = false,
@@ -1584,6 +1586,28 @@ party_update_control_visibility = function()
     ui_set_control_visible(PT.ui.right_widgets, PT.current_index < #PT.handles)
 end
 
+
+local function party_sync_cached_handle(panel, handle, source)
+    if not valid(panel) or not valid(handle) then return false end
+
+    local label = tostring(source or "PT")
+    local ok, err = pcall(function()
+        panel.CachedIndividualHandle = handle
+    end)
+    if not ok then
+        log(label .. " CachedIndividualHandle write failed: " .. tostring(err))
+        return false
+    end
+
+    local current = nil
+    pcall(function() current = unwrap(panel.CachedIndividualHandle) end)
+    if not valid(current) or not same_object(current, handle) then
+        log(label .. " CachedIndividualHandle sync failed")
+        return false
+    end
+    return true
+end
+
 local function party_navigate(direction)
     if not PT.details_open or PT.nickname_editing then return false end
 
@@ -1633,14 +1657,7 @@ local function party_navigate(direction)
         return false
     end
 
-    local refresh_status = PT.status_widget
-    if not valid(refresh_status) then
-        refresh_status = find_status_ancestor(bind_widget)
-        if valid(refresh_status) then PT.status_widget = refresh_status end
-    end
-    if valid(refresh_status) then
-        native_refresh_status(refresh_status, target_handle, "PT")
-    end
+    party_sync_cached_handle(bind_widget, target_handle, "PT navigate")
 
     if serial ~= PT.nav_serial then return true end
 
@@ -1799,6 +1816,20 @@ install_hooks = function()
                 if PT.details_open then
                     party_leave_details()
                     end
+            end, function() end)
+        end)
+    end
+
+    if not hooks_ready.party_skill_open then
+        hooks_ready.party_skill_open = pcall(function()
+            RegisterHook(PARTY_SKILL_OPEN_FN, function(context)
+                if not PT.details_open or not valid(PT.current_handle) then return end
+                local panel = unwrap(context)
+                if not valid(panel) then panel = PT.party_widget end
+                if valid(panel) then
+                    PT.party_widget = panel
+                    party_sync_cached_handle(panel, PT.current_handle, "PT skill popup")
+                end
             end, function() end)
         end)
     end
@@ -1969,6 +2000,7 @@ install_hooks = function()
         and hooks_ready.party_list
         and hooks_ready.party_to_status
         and hooks_ready.party_focus_panel
+        and hooks_ready.party_skill_open
         and hooks_ready.cancel
         and hooks_ready.name_open
         and hooks_ready.name_close
